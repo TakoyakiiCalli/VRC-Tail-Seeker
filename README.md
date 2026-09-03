@@ -2,15 +2,16 @@
 
 A Unity Editor window that sets up **tail-to-hip interaction** on a VRChat avatar. When another avatar's tail (or the editor test object) comes near your hips, your tail curls using your existing clip, the same way VRCFury Depth Animation scrubs a clip by proximity.
 
-Direction is meant to come from the [VRLabs Contact Tracker](https://github.com/VRLabs/Contact-Tracker) plus an Aim Constraint on the tail root. **Curl works. Live rotation toward another user or the test object is not finished yet.**
+Direction uses **Left** and **Right** curl clips on FX, blended by `ContactTracker/X-` and `ContactTracker/X+`. That is the same animator path as proximity curl. Unity Aim / Rotation Constraints are not used — they get overwritten by the humanoid and FX graphs, so the bone never turns even when the tracker floats are moving.
 
 ## Requirements
 
 - Unity with the VRChat SDK3 Avatars package
 - An avatar with a `VRCAvatarDescriptor` and an Animator Controller on the **FX** playable layer
 - A tail with a root bone and a tip transform
-- A hips / pelvis bone (humanoid Hips is auto-detected)
+- An Armature whose first child bone is the hips (detected automatically)
 - Your existing tail curl `AnimationClip` (blendshape sets keyed over time, not looped)
+- Left and right curl clips if you want the tail to turn toward the other user
 - [VRLabs Contact Tracker](https://github.com/VRLabs/Contact-Tracker) (prefab + FX controller)
 - [Gesture Manager](https://github.com/BlackStartx/VRC-Gesture-Manager) is recommended for editor testing
 
@@ -28,9 +29,9 @@ Two avatars that share the same **Collision Tag** (default `TailSeek`) interact 
 
 1. A **Contact Sender** on your **tail tip** broadcasts the tag so other people can detect your tail.
 2. A **proximity receiver** on your **hip** writes `TailSeek_Curl` (0 at the edge of the receiver, 1 at the center).
-3. The FX layer **Tail Seek - Curl** uses **Motion Time** on that float, so proximity scrubs your curl clip from the first frame to the last (VRCFury Depth-style).
-4. Six directional receivers from VRLabs Contact Tracker sit at the hip and are meant to move **TailSeek Tracker Target**.
-5. An **Aim Constraint** on the tail root is meant to point the tail at that target.
+3. The FX layer **Tail Seek** uses **Motion Time** on `TailSeek_Curl`, so proximity scrubs your wrap clip from the first frame to the last (VRCFury Depth-style).
+4. Six directional receivers from VRLabs Contact Tracker sit at the hip and write `ContactTracker/X+`, `X-`, `Y+`, `Y-`, `Z+`, `Z-`.
+5. The same **Tail Seek** layer has **Idle**, **Wrap**, **Left Curl**, and **Right Curl**. Wrap plays when someone is near the hips. Left/Right play when `ContactTracker/X-` or `X+` is high.
 
 Allow Self stays off so your own tail sender cannot curl your own tail. In VRChat, another player's tail sender is what drives you.
 
@@ -39,25 +40,26 @@ The VRLabs prefab's demo **Container / Cube** is deleted on install. It is only 
 ## Usage
 
 1. Open **Tools → Tail Seek → Builder**.
-2. Assign **Avatar**, **Tail Root**, **Tail Tip**, and **Curl Animation**.
-3. Assign **Hip**, or click **Find Hips Bone**.
-4. Click **Find VRLabs Tracker Assets**, or assign the Contact Tracker prefab and FX controller by hand.
-5. Click **BUILD TAIL SEEK SYSTEM**, or **REPLACE / REBUILD EXISTING TAIL SEEK SYSTEM** if you already built an older version.
+2. Assign **Avatar**, **Tail Root**, **Tail Tip**, and **Tail Wrapping Animation**. Hip and the VRLabs Contact Tracker are filled in automatically, and tracker FX is always merged.
+3. Assign **Left Curl Animation** and **Right Curl Animation** under Directional Seeking. Frame 0 should be rest. The last frame should be full curl to that side, including the bone rotation you want.
+4. Click **BUILD TAIL SEEK SYSTEM**, or **REPLACE / REBUILD EXISTING TAIL SEEK SYSTEM** if you already built an older version.
 
 ### Replacing an older build
 
-**Replace / Rebuild** deletes leftover Tail Seek objects, contacts, aim constraints, FX layers, and `TailSeek*` / `ContactTracker/*` parameters, then builds again.
+**Replace / Rebuild** deletes leftover Tail Seek objects, contacts, old aim/rotation constraints, FX layers, and `TailSeek*` / `ContactTracker/*` parameters, then builds again.
 
 **Remove Existing Tail Seek System** only deletes. It only needs the avatar assigned.
 
 ### Editor test object
 
-The builder can create `Assets/TailSeek/Generated/TailSeek Test Object.prefab`.
+The builder writes `Assets/TailSeek/Generated/TailSeek Test Object.prefab` and places an instance on the assigned avatar at the hip.
 
-1. Drag it into the scene.
-2. Enter **Play Mode**, then select **Gesture Manager**.
-3. Move it with **W/A/S/D** and **Q/E** (Shift to go faster), or drag it in the Scene view.
-4. Hold it near the **hips**. Curl should respond. `debugCurl` on the test object should rise off 0.
+1. Enter **Play Mode**, then select **Gesture Manager**.
+2. Move it with **W/A/S/D** and **Q/E** (Shift to go faster), or drag it in the Scene view.
+3. Hold it near the **hips**. Curl should respond. `debugCurl` on the test object should rise off 0.
+4. Move it to the avatar's left or right. `ContactTracker/X-` or `X+` should rise and the matching clip should turn the tail.
+
+Delete the test object before uploading the avatar.
 
 A scene `VRCContactSender` is not another VRChat player, so Gesture Manager will not treat it as "others" on its own. The test object simulates matching proximity receivers (and writes Gesture Manager playable parameters) so you can test curl in the editor.
 
@@ -67,38 +69,34 @@ A scene `VRCContactSender` is not another VRChat player, so Gesture Manager will
 
 | Field | Description |
 | --- | --- |
-| **Avatar** | The `VRCAvatarDescriptor` to build on. |
+| **Avatar** | The `VRCAvatarDescriptor` to build on. **Hip (auto)** is the first bone parented to `Armature`. **VRLabs Tracker (auto)** is the Contact Tracker prefab plus its FX controller. |
 
 ### Tail
 
 | Field | Description |
 | --- | --- |
-| **Tail Root** | First bone of the tail chain. The Aim Constraint is added here. |
+| **Tail Root** | First bone of the tail chain. |
 | **Tail Tip** | End of the tail. The TailSeek **sender** is placed here. |
-| **Curl Animation** | Timed curl clip. Keyframe rest at frame 0 and full curl at the last frame. Required when **Create Curl Animator** is on. |
+| **Tail Wrapping Animation** | Timed wrap clip. Keyframe rest at frame 0 and full wrap at the last frame. Required when **Create Curl Animator** is on. |
 
-### Hip
+### Directional Seeking
 
-| Field | Description |
-| --- | --- |
-| **Hip** | Hips / pelvis. The Contact Tracker and curl **receiver** are placed here. |
-| **Find Hips Bone** | Uses the humanoid Hips bone, then falls back to objects named `Hips`, `Hip`, or `Pelvis`. |
+| Field | Default | Description |
+| --- | --- | --- |
+| **Create Left / Right Curl** | on | Adds **Left Curl** and **Right Curl** states to the **Tail Seek** FX layer. |
+| **Left Curl Animation** | | Timed clip used when `ContactTracker/X-` is high. |
+| **Right Curl Animation** | | Timed clip used when `ContactTracker/X+` is high. |
 
-### Contact Tracker
+Key the tail bone (Z rotation or whatever your rig uses) on these clips. Blendshapes can stay on the wrapping clip if the left/right clips only rotate bones.
 
-| Field | Description |
-| --- | --- |
-| **Tracker Prefab** | VRLabs **Contact Tracker** prefab. |
-| **Tracker FX Controller** | VRLabs **Contact Tracker FX** controller. Layers and parameters are merged into the avatar FX controller. |
-| **Merge Tracker FX Controller** | Copies those layers/parameters into FX. |
-| **Find VRLabs Tracker Assets** | Searches for assets named `Contact Tracker` and `Contact Tracker FX`. |
+If left and right are swapped in-game, swap the two clip fields and rebuild.
 
 ### Contact Settings
 
 | Field | Default | Description |
 | --- | --- | --- |
 | **Collision Tag** | `TailSeek` | Shared tag for senders and receivers. Must match on interacting avatars. |
-| **Tracker Receiver Radius** | `1.0` | Radius of the six directional tracker receivers (`X+`, `X-`, `Y+`, `Y-`, `Z+`, `Z-`). |
+| **Tracker Receiver Radius** | `2.0` | Radius of the six directional tracker receivers (`X+`, `X-`, `Y+`, `Y-`, `Z+`, `Z-`). Keep this at least as large as Curl Start Distance so left/right have signal while curling. |
 | **Tail Sender Radius** | `0.025` | Radius of the sender on the tail tip. |
 | **Allow Self** | off | Leave off so your own tail sender cannot curl your own tail. |
 | **Allow Others** | on | Other avatars' senders can trigger your hip receivers. |
@@ -108,24 +106,16 @@ A scene `VRCContactSender` is not another VRChat player, so Gesture Manager will
 | Field | Default | Description |
 | --- | --- | --- |
 | **Create Curl Animator** | on | Adds the curl float and the Motion Time FX layer. |
-| **Curl Start Distance** | `0.50` | Hip proximity receiver radius. Outside this, the clip stays on frame 0. |
-| **Full Curl Distance** | `0.10` | Must be smaller than Curl Start Distance. |
+| **Curl Start Distance** | `2.0` | Hip proximity receiver radius. Outside this, the clip stays on frame 0. |
+| **Full Curl Distance** | `2.0` | Radius at which the clip reaches its last frame. Default 2 means full curl anywhere inside a 2-unit sphere. Raise Start above Full to ramp the four blendshape sets first. |
 | **Curl Parameter** | `TailSeek_Curl` | FX float driven by the hip proximity receiver. |
-
-### Directional Seeking
-
-| Field | Default | Description |
-| --- | --- | --- |
-| **Aim Tail Toward Target** | on | Adds an Aim Constraint from the tail root to `TailSeek Tracker Target`. |
-| **Tail Forward Axis** | `(0, 0, 1)` | Local axis of the tail root that should point at the target. |
-| **Tail Up Axis** | `(0, 1, 0)` | Local up axis for the Aim Constraint. |
 
 ### Play Mode Test Object
 
 | Field | Description |
 | --- | --- |
-| **Create Test Prefab** | Writes the WASD test sender prefab. |
-| **CREATE / RECREATE TEST PREFAB** | Regenerates that prefab without rebuilding the avatar. |
+| **Create Test Prefab** | Writes the WASD test sender prefab and places it on the avatar at the hip. |
+| **CREATE / RECREATE TEST PREFAB** | Regenerates that prefab and re-places it on the avatar. |
 
 ## What gets generated
 
@@ -133,6 +123,7 @@ On the avatar root (world position at the hip):
 
 - `TailSeek Contact Tracker` — VRLabs tracker, collision tag configured, demo Container/Cube removed
 - `TailSeek Tracker Target` — moved out of the tracker, as VRLabs requires
+- `TailSeek Test Object` — Play Mode test sender, placed at the hip. Delete before upload.
 
 On the hip:
 
@@ -142,25 +133,18 @@ On the tail tip:
 
 - `TailSeek Sender` — `VRCContactSender` so other avatars can detect this tail
 
-On the tail root (if aiming is enabled):
-
-- `AimConstraint` targeting `TailSeek Tracker Target`
-
 In the avatar FX controller:
 
-- VRLabs layers `Contact Tracker Control` and `Contact Tracker Blend Tree` (if merge is on)
-- Float `TailSeek_Curl`
-- Layer `Tail Seek - Curl`, state **Curl Depth**, Motion Time = curl parameter, weight 1
+- VRLabs layers `Contact Tracker Control` and `Contact Tracker Blend Tree`
+- Floats `TailSeek_Curl` and `TailSeek_Curl_Time`
+- Layer `Tail Seek`, states **Idle** / **Wrap** / **Left Curl** / **Right Curl**, Motion Time = `TailSeek_Curl`, weight 1
 
-## Known issues
+Rebuild removes leftover Unity Aim / Rotation Constraints from older builds.
 
-**Rotation from live location is not working yet.** Curl proximity can drive the blendshape clip, but the tail does not yet reliably rotate toward another player's tail or the editor test object using live positional data from the Contact Tracker (`ContactTracker/X+` … `Z-` → Tracker Target → Aim Constraint).
-
-That is the next piece to fix: keep the Tracker Target locked to the other sender's live position (in-game other user, or the test object in Play Mode / Gesture Manager) so the Aim Constraint actually follows them.
-
-Until then:
+## Testing
 
 - Test curl by moving the test object to the **hips**, not the tail tip.
+- With default Full Curl Distance **2**, anything inside a 2-unit sphere of the hip is full curl. Raise **Curl Start Distance** above 2 if you want the clip to ramp in first.
 - `ContactTracker/Size` staying at 0 is normal; it is the VRLabs scale control, not curl.
 - Do not turn on **Allow Self** just to test. That makes your own tip sender fight the hip receiver.
 
@@ -168,14 +152,15 @@ Until then:
 
 | Problem | What to check |
 | --- | --- |
-| Build button disabled | Avatar, tail root, tail tip, hip, tracker prefab, and tracker FX controller are required. Curl animation is also required when Create Curl Animator is on. |
-| Tracker assets not found | Import VRLabs Contact Tracker, then assign the prefab and FX controller manually. |
+| Build button disabled | Avatar, tail root, tail tip, and hip (first Armature child) are required. Tail Wrapping Animation is required when Create Curl Animator is on. Left and Right clips are required when Create Left / Right Curl is on. VRLabs Contact Tracker must be imported so it can be found automatically. |
+| Tracker assets not found | Import VRLabs Contact Tracker. The builder looks for assets named `Contact Tracker` and `Contact Tracker FX`. |
 | Build error: no Tracker Target | Use the official VRLabs Contact Tracker prefab. |
 | Build error: no FX controller | Assign an Animator Controller on the avatar's FX playable layer. |
 | Curl parameter exists but is not a Float | Rename it in the builder, or change/remove the existing parameter. |
 | `(NO VALID ANIMATIONS)` on new layers | Rebuild with the current builder. Older builds could strip motions when saving layer weight. |
 | Test object near the tail does nothing | Receivers are on the **hip**. Move the test object there. Use Play Mode + Gesture Manager. |
-| `debugCurl` moves but the tail does not | FX layer **Tail Seek - Curl** weight must be 1. The clip must animate the same blendshapes as the avatar meshes. |
+| `debugCurl` moves but the tail does not | FX layer **Tail Seek** weight must be 1. The orange state should be **Wrap** when the sphere is on the hips. The wrap clip must animate the same blendshapes as the avatar meshes. |
+| Location floats move but the bone does not turn | Assign Left/Right clips that actually key the tail bone. Rebuild so **Tail Seek** has **Left Curl** / **Right Curl**. Move the test object left or right of the hips, not only on the center. |
+| Left and right are swapped | Swap the Left/Right clip fields and rebuild. |
 | Cube still visible on the tracker | Rebuild; the demo Container/Cube is removed on install. |
 | Tails do not interact in VRChat | Same collision tag on both avatars. Allow Others on. Contact Tracker FX merged. Enable `ContactTracker/Control` if the VRLabs menu toggle is off. |
-| Tail aims the wrong way | Change **Tail Forward Axis** / **Tail Up Axis**. Live aiming is still an open issue (see Known issues). |

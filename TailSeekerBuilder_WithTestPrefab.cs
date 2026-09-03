@@ -20,10 +20,13 @@ namespace TailSeek
     /// Builds a tail-to-tail contact system using VRChat Contacts and the VRLabs Contact Tracker.
     ///
     /// Important implementation details:
-    /// - The Contact Tracker and curl receiver are placed on the Hip.
+    /// - The Contact Tracker and curl receiver are placed on the Hip, which is
+    ///   the first bone parented to the Armature.
     ///   The tail sender stays on the Tail Tip so other avatars can detect this tail.
     /// - The VRLabs "Tracker Target" is moved outside the Contact Tracker, as required by
     ///   the VRLabs installation instructions.
+    /// - Directional seeking uses Left/Right curl clips on FX, blended by
+    ///   ContactTracker/X- and ContactTracker/X+ (same Motion Time as proximity curl).
     /// - The supplied Contact Tracker FX controller is merged into the avatar FX controller.
     /// - The user's curl layer is added after the tracker layers.
     /// </summary>
@@ -33,10 +36,17 @@ namespace TailSeek
         private const string GeneratedSenderName = "TailSeek Sender";
         private const string GeneratedCurlReceiverName = "TailSeek Curl Receiver";
         private const string GeneratedTargetName = "TailSeek Tracker Target";
+        private const string GeneratedAimProxyName = "TailSeek Aim Proxy";
+        private const string GeneratedTestObjectName = "TailSeek Test Object";
         private const string CurlLayerName = "Tail Seek - Curl";
+        private const string CurlRemapLayerName = "Tail Seek - Curl Remap";
+        private const string DirectionLayerName = "Tail Seek - Direction";
+        private const string SeekLayerName = "Tail Seek";
 
         private const string TrackerControlParameter = "ContactTracker/Control";
         private const string TrackerSizeParameter = "ContactTracker/Size";
+        private const string TrackerLeftParameter = "ContactTracker/X-";
+        private const string TrackerRightParameter = "ContactTracker/X+";
 
         private VRCAvatarDescriptor avatar;
 
@@ -51,30 +61,30 @@ namespace TailSeek
         private string collisionTag = "TailSeek";
 
         // Radius of each of the six VRChat proximity receivers.
-        private float trackerSize = 1.0f;
+        private float trackerSize = 2.0f;
         private float senderRadius = 0.025f;
 
         private bool allowSelf = false;
         private bool allowOthers = true;
 
-        private float curlDistance = 0.50f;
-        private float fullCurlDistance = 0.10f;
+        private float curlDistance = 2.0f;
+        private float fullCurlDistance = 2.0f;
 
         private string curlParameter = "TailSeek_Curl";
 
-        private bool addDirectionalConstraint = true;
-        private Vector3 aimAxis = Vector3.forward;
-        private Vector3 upAxis = Vector3.up;
+        private bool addDirectionalCurl = true;
+        private AnimationClip leftCurlAnimation;
+        private AnimationClip rightCurlAnimation;
 
         private bool addCurlAnimator = true;
-        private bool mergeTrackerFX = true;
-
         private bool createTestPrefab = true;
         private float testObjectScale = 0.10f;
         private float testMoveSpeed = 1.5f;
         private string testPrefabPath = "Assets/TailSeek/Generated/TailSeek Test Object.prefab";
 
         private Vector2 scroll;
+        private readonly HashSet<string> expandedHelpIds = new HashSet<string>();
+        private GUIContent infoIcon;
 
         [MenuItem("Tools/Tail Seek/Builder")]
         public static void ShowWindow()
@@ -82,9 +92,18 @@ namespace TailSeek
             GetWindow<TailSeekerBuilder>("Tail Seek Builder");
         }
 
+        private void OnEnable()
+        {
+            TryFindTrackerAssets();
+        }
+
         private void OnGUI()
         {
+            TryFindTrackerAssets();
             scroll = EditorGUILayout.BeginScrollView(scroll);
+
+            float previousLabelWidth = EditorGUIUtility.labelWidth;
+            EditorGUIUtility.labelWidth = 220f;
 
             EditorGUILayout.Space(8);
             EditorGUILayout.LabelField("TAIL SEEK BUILDER", EditorStyles.boldLabel);
@@ -93,213 +112,211 @@ namespace TailSeek
                 "Builds tail-to-hip interaction using VRChat Contacts and the VRLabs Contact Tracker.\n\n" +
                 "The tracker and curl receiver are placed on the Hip. " +
                 "The tail sender stays on the Tail Tip so other avatars can detect this tail. " +
-                "The VRLabs Tracker Target is placed outside the tracker and used by the Aim Constraint.",
+                "Left/Right curl clips on FX turn the tail from ContactTracker/X- and X+.",
                 MessageType.Info);
 
             EditorGUILayout.Space(10);
             EditorGUILayout.LabelField("Avatar", EditorStyles.boldLabel);
 
-            VRCAvatarDescriptor previousAvatar = avatar;
+            avatar = HelpObjectField(
+                "avatar",
+                "Avatar",
+                avatar,
+                "The VRCAvatarDescriptor to build on.",
+                true);
 
-            avatar = (VRCAvatarDescriptor)EditorGUILayout.ObjectField(
-                "Avatar", avatar, typeof(VRCAvatarDescriptor), true);
+            hip = avatar != null ? FindHipsBone() : null;
 
-            if (avatar != previousAvatar ||
-                (avatar != null && hip == null))
+            if (avatar != null)
             {
-                hip = FindHipsBone();
+                if (hip != null)
+                {
+                    HelpValueLabel(
+                        "hip",
+                        "Hip (auto)",
+                        hip.name,
+                        "The first bone parented to the Armature. The Contact Tracker and wrap receiver are placed here.");
+                }
+                else
+                {
+                    EditorGUILayout.HelpBox(
+                        "Could not find the Hip. The first bone parented to the Armature is used automatically.",
+                        MessageType.Warning);
+                }
+            }
+
+            if (contactTrackerPrefab != null &&
+                contactTrackerController != null)
+            {
+                HelpValueLabel(
+                    "tracker",
+                    "VRLabs Tracker (auto)",
+                    contactTrackerPrefab.name + " + FX",
+                    "The VRLabs Contact Tracker prefab and FX controller. Found automatically and always merged into the avatar FX controller.");
+            }
+            else
+            {
+                EditorGUILayout.HelpBox(
+                    "Could not find the VRLabs Contact Tracker prefab and FX controller. Import Contact Tracker into this project.",
+                    MessageType.Warning);
             }
 
             EditorGUILayout.Space(8);
             EditorGUILayout.LabelField("Tail", EditorStyles.boldLabel);
 
-            tailRoot = (Transform)EditorGUILayout.ObjectField(
-                new GUIContent(
-                    "Tail Root",
-                    "First bone of the tail chain. The Aim Constraint is added here."),
-                tailRoot, typeof(Transform), true);
+            tailRoot = HelpObjectField(
+                "tailRoot",
+                "Tail Root",
+                tailRoot,
+                "First bone of the tail chain.",
+                true);
 
-            tailTip = (Transform)EditorGUILayout.ObjectField(
-                new GUIContent(
-                    "Tail Tip",
-                    "End of the tail. The TailSeek sender is placed here so other avatars can detect this tail."),
-                tailTip, typeof(Transform), true);
+            tailTip = HelpObjectField(
+                "tailTip",
+                "Tail Tip",
+                tailTip,
+                "End of the tail. The TailSeek sender is placed here so other avatars can detect this tail.",
+                true);
 
-            EditorGUILayout.Space(8);
-            EditorGUILayout.LabelField("Hip", EditorStyles.boldLabel);
-
-            hip = (Transform)EditorGUILayout.ObjectField(
-                new GUIContent(
-                    "Hip",
-                    "Hips/pelvis bone. The Contact Tracker and curl receiver are placed here."),
-                hip, typeof(Transform), true);
-
-            if (GUILayout.Button("Find Hips Bone"))
-                hip = FindHipsBone();
-
-            curlAnimation = (AnimationClip)EditorGUILayout.ObjectField(
-                new GUIContent(
-                    "Curl Animation",
-                    "Existing tail curl animation."),
-                curlAnimation, typeof(AnimationClip), false);
-
-            EditorGUILayout.Space(8);
-            EditorGUILayout.LabelField("Contact Tracker", EditorStyles.boldLabel);
-
-            contactTrackerPrefab = (GameObject)EditorGUILayout.ObjectField(
-                new GUIContent(
-                    "Tracker Prefab",
-                    "VRLabs Contact Tracker prefab."),
-                contactTrackerPrefab, typeof(GameObject), false);
-
-            contactTrackerController = (AnimatorController)EditorGUILayout.ObjectField(
-                new GUIContent(
-                    "Tracker FX Controller",
-                    "VRLabs Contact Tracker FX controller. Its layers and parameters are merged into the avatar FX controller."),
-                contactTrackerController, typeof(AnimatorController), false);
-
-            if (GUILayout.Button("Find VRLabs Tracker Assets"))
-                FindTrackerAssets();
-
-            mergeTrackerFX = EditorGUILayout.Toggle(
-                new GUIContent(
-                    "Merge Tracker FX Controller",
-                    "Copies the VRLabs Contact Tracker FX parameters and layers into the avatar FX controller."),
-                mergeTrackerFX);
-
-            EditorGUILayout.Space(8);
-            EditorGUILayout.LabelField("Contact Settings", EditorStyles.boldLabel);
-
-            collisionTag = EditorGUILayout.TextField(
-                "Collision Tag",
-                collisionTag);
-
-            trackerSize = EditorGUILayout.FloatField(
-                new GUIContent(
-                    "Tracker Receiver Radius",
-                    "Radius of each of the six directional tracker receivers."),
-                trackerSize);
-
-            senderRadius = EditorGUILayout.FloatField(
-                new GUIContent(
-                    "Tail Sender Radius",
-                    "Radius of the Contact Sender at the tail tip."),
-                senderRadius);
-
-            allowSelf = EditorGUILayout.Toggle(
-                "Allow Self",
-                allowSelf);
-
-            allowOthers = EditorGUILayout.Toggle(
-                "Allow Others",
-                allowOthers);
-
-            EditorGUILayout.Space(8);
-            EditorGUILayout.LabelField("Curl", EditorStyles.boldLabel);
-
-            addCurlAnimator = EditorGUILayout.Toggle(
-                "Create Curl Animator",
-                addCurlAnimator);
-
-            if (addCurlAnimator)
-            {
-                EditorGUILayout.HelpBox(
-                    "The curl clip is driven like VRCFury Depth Animation: the proximity float " +
-                    "scrubs the clip from start to end (Motion Time). Put your four blendshape " +
-                    "sets as keyframes along the clip timeline. Frame 0 should be rest, the last " +
-                    "frame should be full curl. Do not loop the clip.",
-                    MessageType.Info);
-
-                curlDistance = EditorGUILayout.FloatField(
-                    new GUIContent(
-                        "Curl Start Distance",
-                        "Radius of the proximity receiver. Outside this radius the clip is at frame 0."),
-                    curlDistance);
-
-                fullCurlDistance = EditorGUILayout.FloatField(
-                    new GUIContent(
-                        "Full Curl Distance",
-                        "Distance at which the clip reaches its last frame. Must be smaller than Curl Start Distance."),
-                    fullCurlDistance);
-
-                curlParameter = EditorGUILayout.TextField(
-                    "Curl Parameter",
-                    curlParameter);
-            }
+            curlAnimation = HelpObjectField(
+                "wrapAnim",
+                "Tail Wrapping Animation",
+                curlAnimation,
+                "Existing tail wrapping animation. Frame 0 = rest, last frame = full wrap.",
+                false);
 
             EditorGUILayout.Space(8);
             EditorGUILayout.LabelField(
                 "Directional Seeking",
                 EditorStyles.boldLabel);
 
-            addDirectionalConstraint = EditorGUILayout.Toggle(
-                new GUIContent(
-                    "Aim Tail Toward Target",
-                    "Adds an Aim Constraint using the Contact Tracker's Tracker Target."),
-                addDirectionalConstraint);
+            addDirectionalCurl = HelpToggle(
+                "leftRight",
+                "Create Left / Right Curl",
+                addDirectionalCurl,
+                "Plays Left and Right curl clips from ContactTracker/X- and ContactTracker/X+.\n\n" +
+                "Unity constraints cannot rotate humanoid / FX bones reliably in VRChat — the animator overwrites them. " +
+                "These clips run on FX instead, the same way proximity wrapping already works.\n\n" +
+                "Key the tail bone rotation you want (Z or otherwise) plus any extra shapes. " +
+                "The direction layer stays Idle while you are centered so the main wrap can play. " +
+                "ContactTracker/X- plays Left. ContactTracker/X+ plays Right. " +
+                "Proximity still scrubs the clip through TailSeek_Curl_Time.");
 
-            if (addDirectionalConstraint)
+            if (addDirectionalCurl)
             {
-                aimAxis = EditorGUILayout.Vector3Field(
-                    new GUIContent(
-                        "Tail Forward Axis",
-                        "Local axis of the tail root that should point toward the target."),
-                    aimAxis);
+                leftCurlAnimation = HelpObjectField(
+                    "leftAnim",
+                    "Left Curl Animation",
+                    leftCurlAnimation,
+                    "Timed clip for the other user on this avatar's left. Frame 0 = rest, last frame = full left curl.",
+                    false);
 
-                upAxis = EditorGUILayout.Vector3Field(
-                    "Tail Up Axis",
-                    upAxis);
+                rightCurlAnimation = HelpObjectField(
+                    "rightAnim",
+                    "Right Curl Animation",
+                    rightCurlAnimation,
+                    "Timed clip for the other user on this avatar's right. Frame 0 = rest, last frame = full right curl.",
+                    false);
+            }
+
+            EditorGUILayout.Space(8);
+            EditorGUILayout.LabelField("Contact Settings", EditorStyles.boldLabel);
+
+            collisionTag = HelpTextField(
+                "tag",
+                "Collision Tag",
+                collisionTag,
+                "Shared tag for senders and receivers. Must match on interacting avatars.");
+
+            trackerSize = HelpFloatField(
+                "trackerRadius",
+                "Tracker Receiver Radius",
+                trackerSize,
+                "Radius of each of the six directional tracker receivers (X+, X-, Y+, Y-, Z+, Z-). Keep this at least as large as Curl Start Distance.");
+
+            senderRadius = HelpFloatField(
+                "senderRadius",
+                "Tail Sender Radius",
+                senderRadius,
+                "Radius of the Contact Sender at the tail tip.");
+
+            allowSelf = HelpToggle(
+                "allowSelf",
+                "Allow Self",
+                allowSelf,
+                "Leave off so your own tail sender cannot wrap your own tail.");
+
+            allowOthers = HelpToggle(
+                "allowOthers",
+                "Allow Others",
+                allowOthers,
+                "Other avatars' senders can trigger your hip receivers.");
+
+            EditorGUILayout.Space(8);
+            EditorGUILayout.LabelField("Curl", EditorStyles.boldLabel);
+
+            addCurlAnimator = HelpToggle(
+                "curlAnimator",
+                "Create Curl Animator",
+                addCurlAnimator,
+                "Adds the wrap float and the Motion Time FX layer.\n\n" +
+                "The wrap clip is driven like VRCFury Depth Animation (Motion Time). " +
+                "Outside Curl Start Distance the clip is at frame 0. At Full Curl Distance " +
+                "and closer, the clip is on its last frame. Defaults: start 2, full 2 — " +
+                "so anything inside a radius of 2 is full wrap. Raise Start above Full " +
+                "if you want the blendshape sets to ramp in before that.");
+
+            if (addCurlAnimator)
+            {
+                curlDistance = HelpFloatField(
+                    "curlStart",
+                    "Curl Start Distance",
+                    curlDistance,
+                    "Radius of the hip proximity receiver. Outside this radius the clip is at frame 0.");
+
+                fullCurlDistance = HelpFloatField(
+                    "curlFull",
+                    "Full Curl Distance",
+                    fullCurlDistance,
+                    "Radius at which the clip reaches its last frame. Use 2 for full wrap anywhere inside a 2-unit sphere. Must be greater than 0 and no larger than Curl Start Distance.");
+
+                curlParameter = HelpTextField(
+                    "curlParam",
+                    "Curl Parameter",
+                    curlParameter,
+                    "FX float driven by the hip proximity receiver.");
             }
 
             EditorGUILayout.Space(8);
             EditorGUILayout.LabelField("Play Mode Test Object", EditorStyles.boldLabel);
 
-            createTestPrefab = EditorGUILayout.Toggle(
-                new GUIContent(
-                    "Create Test Prefab",
-                    "Creates a visible Contact Sender prefab for testing the Tail Seek collision system."),
-                createTestPrefab);
+            createTestPrefab = HelpToggle(
+                "testPrefab",
+                "Create Test Prefab",
+                createTestPrefab,
+                "Creates a visible Contact Sender prefab for testing, then places it on the assigned avatar at the hip.\n\n" +
+                "Saved at:\n" + testPrefabPath +
+                "\n\nEnter Play Mode, then select Gesture Manager. " +
+                "Move with W/A/S/D and Q/E (Shift to go faster), or drag it in the Scene view.\n\n" +
+                "Delete the test object before uploading the avatar.");
 
             if (createTestPrefab)
             {
-                testObjectScale = EditorGUILayout.FloatField(
-                    new GUIContent("Test Object Scale", "Visual diameter/scale of the generated test sphere."),
-                    testObjectScale);
+                testObjectScale = HelpFloatField(
+                    "testScale",
+                    "Test Object Scale",
+                    testObjectScale,
+                    "Visual diameter/scale of the generated test sphere.");
 
-                testMoveSpeed = EditorGUILayout.FloatField(
-                    new GUIContent("Test Move Speed", "Keyboard movement speed in Play Mode."),
-                    testMoveSpeed);
-
-                EditorGUILayout.HelpBox(
-                    "After building, the prefab is created at:\n" + testPrefabPath +
-                    "\n\nDrag it into the scene, enter Play Mode, then select Gesture Manager.\n" +
-                    "Move with W/A/S/D and Q/E (Shift to go faster), or drag it in the Scene view.\n\n" +
-                    "The test object simulates another player's TailSeek sender. A scene Contact Sender is not a VRChat player, " +
-                    "so it cannot trigger avatar receivers that have Allow Self disabled.",
-                    MessageType.None);
-
-                if (GUILayout.Button("CREATE / RECREATE TEST PREFAB"))
-                {
-                    try
-                    {
-                        CreateTestObjectPrefab();
-                    }
-                    catch (Exception exception)
-                    {
-                        Debug.LogException(exception);
-                        EditorUtility.DisplayDialog("Test Prefab Error", exception.Message, "OK");
-                    }
-                }
+                testMoveSpeed = HelpFloatField(
+                    "testSpeed",
+                    "Test Move Speed",
+                    testMoveSpeed,
+                    "Keyboard movement speed in Play Mode.");
             }
 
             EditorGUILayout.Space(15);
             EditorGUILayout.LabelField("Existing System", EditorStyles.boldLabel);
-
-            EditorGUILayout.HelpBox(
-                "Removes leftover Tail Seek objects, contact senders/receivers, aim constraints, " +
-                "FX layers, and parameters from previous builds on the assigned avatar, then rebuilds " +
-                "with the current settings.",
-                MessageType.None);
 
             bool valid =
                 avatar != null &&
@@ -308,13 +325,25 @@ namespace TailSeek
                 hip != null &&
                 contactTrackerPrefab != null &&
                 contactTrackerController != null &&
-                (!addCurlAnimator || curlAnimation != null);
+                (!addCurlAnimator || curlAnimation != null) &&
+                (!addDirectionalCurl ||
+                 (leftCurlAnimation != null && rightCurlAnimation != null));
+
+            if (!valid)
+            {
+                EditorGUILayout.HelpBox(
+                    "Assign Avatar, Tail Root, Tail Tip, Tail Wrapping Animation when Create Curl Animator is enabled, " +
+                    "and Left/Right Curl when Create Left / Right Curl is enabled. " +
+                    "The VRLabs Contact Tracker is found automatically.",
+                    MessageType.Warning);
+            }
+
+            EditorGUILayout.BeginHorizontal();
 
             GUI.enabled = valid;
-
             if (GUILayout.Button(
                 "REPLACE / REBUILD EXISTING TAIL SEEK SYSTEM",
-                GUILayout.Height(32)))
+                GUILayout.Height(36)))
             {
                 if (EditorUtility.DisplayDialog(
                     "Replace Existing Tail Seek System",
@@ -329,8 +358,9 @@ namespace TailSeek
             }
 
             GUI.enabled = avatar != null;
-
-            if (GUILayout.Button("REMOVE EXISTING TAIL SEEK SYSTEM"))
+            if (GUILayout.Button(
+                "REMOVE EXISTING TAIL SEEK SYSTEM",
+                GUILayout.Height(36)))
             {
                 if (EditorUtility.DisplayDialog(
                     "Remove Existing Tail Seek System",
@@ -344,105 +374,252 @@ namespace TailSeek
                 }
             }
 
+            EditorGUILayout.EndHorizontal();
+
+            EditorGUILayout.BeginHorizontal();
+
             GUI.enabled = valid;
-
-            EditorGUILayout.Space(8);
-
             if (GUILayout.Button(
                 "BUILD TAIL SEEK SYSTEM",
-                GUILayout.Height(45)))
+                GUILayout.Height(36)))
             {
                 Build();
             }
 
-            GUI.enabled = true;
-
-            if (!valid)
+            GUI.enabled = createTestPrefab && avatar != null;
+            if (GUILayout.Button(
+                "CREATE / RECREATE TEST PREFAB",
+                GUILayout.Height(36)))
             {
-                EditorGUILayout.Space(5);
-
-                EditorGUILayout.HelpBox(
-                    "Assign Avatar, Tail Root, Tail Tip, Hip, Tracker Prefab, Tracker FX Controller, " +
-                    "and Curl Animation when Create Curl Animator is enabled.",
-                    MessageType.Warning);
+                try
+                {
+                    CreateTestObjectPrefab();
+                }
+                catch (Exception exception)
+                {
+                    Debug.LogException(exception);
+                    EditorUtility.DisplayDialog("Test Prefab Error", exception.Message, "OK");
+                }
             }
 
-            EditorGUILayout.Space(10);
+            EditorGUILayout.EndHorizontal();
+            GUI.enabled = true;
 
-            EditorGUILayout.HelpBox(
-                "The builder places the Contact Tracker and curl receiver on the Hip, keeps the sender on the Tail Tip, and merges the " +
-                "VRLabs Contact Tracker FX controller into the avatar FX controller.",
-                MessageType.None);
-
+            EditorGUIUtility.labelWidth = previousLabelWidth;
             EditorGUILayout.EndScrollView();
+        }
+
+        // =====================================================================
+        // CLICK-TO-EXPAND FIELD HELP
+        // =====================================================================
+
+        private GUIContent InfoIcon
+        {
+            get
+            {
+                if (infoIcon == null)
+                {
+                    string iconName = EditorGUIUtility.isProSkin
+                        ? "d_console.infoicon.sml"
+                        : "console.infoicon.sml";
+
+                    infoIcon = EditorGUIUtility.IconContent(iconName);
+                    if (infoIcon == null || infoIcon.image == null)
+                        infoIcon = EditorGUIUtility.IconContent("console.infoicon.sml");
+                }
+
+                return infoIcon;
+            }
+        }
+
+        private T HelpObjectField<T>(
+            string id,
+            string label,
+            T value,
+            string help,
+            bool allowSceneObjects)
+            where T : UnityEngine.Object
+        {
+            Rect fieldRect = DrawHelpPrefix(id, label);
+            value = (T)EditorGUI.ObjectField(
+                fieldRect,
+                value,
+                typeof(T),
+                allowSceneObjects);
+            DrawExpandedHelp(id, help);
+            return value;
+        }
+
+        private bool HelpToggle(
+            string id,
+            string label,
+            bool value,
+            string help)
+        {
+            Rect fieldRect = DrawHelpPrefix(id, label);
+            value = EditorGUI.Toggle(fieldRect, value);
+            DrawExpandedHelp(id, help);
+            return value;
+        }
+
+        private float HelpFloatField(
+            string id,
+            string label,
+            float value,
+            string help)
+        {
+            Rect fieldRect = DrawHelpPrefix(id, label);
+            value = EditorGUI.FloatField(fieldRect, value);
+            DrawExpandedHelp(id, help);
+            return value;
+        }
+
+        private string HelpTextField(
+            string id,
+            string label,
+            string value,
+            string help)
+        {
+            Rect fieldRect = DrawHelpPrefix(id, label);
+            value = EditorGUI.TextField(fieldRect, value);
+            DrawExpandedHelp(id, help);
+            return value;
+        }
+
+        private void HelpValueLabel(
+            string id,
+            string label,
+            string value,
+            string help)
+        {
+            Rect fieldRect = DrawHelpPrefix(id, label);
+            EditorGUI.LabelField(fieldRect, value);
+            DrawExpandedHelp(id, help);
+        }
+
+        private Rect DrawHelpPrefix(string id, string label)
+        {
+            Rect row = EditorGUILayout.GetControlRect();
+            float indent = EditorGUI.indentLevel * 15f;
+            float iconSize = 16f;
+            float gap = 3f;
+
+            Rect iconRect = new Rect(
+                row.x + indent,
+                row.y + Mathf.Max(0f, (row.height - iconSize) * 0.5f),
+                iconSize,
+                iconSize);
+
+            Rect nameRect = new Rect(
+                iconRect.xMax + gap,
+                row.y,
+                EditorGUIUtility.labelWidth - indent - iconSize - gap,
+                row.height);
+
+            Rect fieldRect = new Rect(
+                row.x + EditorGUIUtility.labelWidth,
+                row.y,
+                Mathf.Max(0f, row.width - EditorGUIUtility.labelWidth),
+                row.height);
+
+            if (GUI.Button(iconRect, InfoIcon, EditorStyles.label) ||
+                GUI.Button(nameRect, label, EditorStyles.label))
+            {
+                ToggleHelp(id);
+            }
+
+            EditorGUIUtility.AddCursorRect(iconRect, MouseCursor.Link);
+            EditorGUIUtility.AddCursorRect(nameRect, MouseCursor.Link);
+            return fieldRect;
+        }
+
+        private void DrawExpandedHelp(string id, string help)
+        {
+            if (string.IsNullOrEmpty(help) ||
+                !expandedHelpIds.Contains(id))
+            {
+                return;
+            }
+
+            EditorGUILayout.HelpBox(help, MessageType.Info);
+        }
+
+        private void ToggleHelp(string id)
+        {
+            if (!expandedHelpIds.Add(id))
+                expandedHelpIds.Remove(id);
         }
 
         // =====================================================================
         // FIND VRLABS ASSETS
         // =====================================================================
 
-        private void FindTrackerAssets()
+        private void TryFindTrackerAssets()
         {
-            contactTrackerPrefab = null;
-            contactTrackerController = null;
-
-            string[] prefabGuids =
-                AssetDatabase.FindAssets(
-                    "Contact Tracker t:Prefab");
-
-            foreach (string guid in prefabGuids)
+            if (contactTrackerPrefab == null)
             {
-                string path =
-                    AssetDatabase.GUIDToAssetPath(guid);
-
-                GameObject prefab =
-                    AssetDatabase.LoadAssetAtPath<GameObject>(path);
-
-                if (prefab != null &&
-                    prefab.name == "Contact Tracker")
-                {
-                    contactTrackerPrefab = prefab;
-                    break;
-                }
+                contactTrackerPrefab = FindNamedAsset<GameObject>(
+                    "Contact Tracker",
+                    "t:Prefab");
             }
 
-            string[] controllerGuids =
-                AssetDatabase.FindAssets(
-                    "Contact Tracker FX t:AnimatorController");
-
-            foreach (string guid in controllerGuids)
+            if (contactTrackerController == null)
             {
-                string path =
-                    AssetDatabase.GUIDToAssetPath(guid);
+                contactTrackerController = FindNamedAsset<AnimatorController>(
+                    "Contact Tracker FX",
+                    "t:AnimatorController");
+            }
+        }
 
-                AnimatorController controller =
-                    AssetDatabase.LoadAssetAtPath<AnimatorController>(path);
+        private static T FindNamedAsset<T>(string assetName, string filter)
+            where T : UnityEngine.Object
+        {
+            string[] guids = AssetDatabase.FindAssets(assetName + " " + filter);
 
-                if (controller != null &&
-                    controller.name == "Contact Tracker FX")
-                {
-                    contactTrackerController = controller;
-                    break;
-                }
+            for (int i = 0; i < guids.Length; i++)
+            {
+                string path = AssetDatabase.GUIDToAssetPath(guids[i]);
+                T asset = AssetDatabase.LoadAssetAtPath<T>(path);
+                if (asset != null && asset.name == assetName)
+                    return asset;
             }
 
-            Repaint();
-
-            if (contactTrackerPrefab == null ||
-                contactTrackerController == null)
-            {
-                EditorUtility.DisplayDialog(
-                    "Tracker Assets Not Found",
-                    "The VRLabs Contact Tracker assets could not be found automatically.\n\n" +
-                    "Assign the prefab and FX controller manually.",
-                    "OK");
-            }
+            return null;
         }
 
         private Transform FindHipsBone()
         {
+            Transform armature = FindArmature();
+            if (armature == null)
+                return null;
+
+            for (int i = 0; i < armature.childCount; i++)
+            {
+                Transform child = armature.GetChild(i);
+                if (child == null)
+                    continue;
+
+                if (IsGeneratedObjectName(child.name))
+                    continue;
+
+                return child;
+            }
+
+            return null;
+        }
+
+        private Transform FindArmature()
+        {
             if (avatar == null)
                 return null;
+
+            Transform namedArmature =
+                FindChildRecursiveIgnoreCase(
+                    avatar.transform,
+                    "Armature");
+
+            if (namedArmature != null)
+                return namedArmature;
 
             Animator animator = avatar.GetComponent<Animator>();
             if (animator != null && animator.isHuman)
@@ -450,23 +627,20 @@ namespace TailSeek
                 Transform humanHips =
                     animator.GetBoneTransform(HumanBodyBones.Hips);
 
-                if (humanHips != null)
-                    return humanHips;
+                if (humanHips != null &&
+                    humanHips.parent != null)
+                {
+                    return humanHips.parent;
+                }
             }
 
-            Transform namedHips =
-                FindChildRecursive(avatar.transform, "Hips");
+            return null;
+        }
 
-            if (namedHips != null)
-                return namedHips;
-
-            Transform namedHip =
-                FindChildRecursive(avatar.transform, "Hip");
-
-            if (namedHip != null)
-                return namedHip;
-
-            return FindChildRecursive(avatar.transform, "Pelvis");
+        private static bool IsGeneratedObjectName(string objectName)
+        {
+            return objectName.StartsWith("TailSeek", StringComparison.OrdinalIgnoreCase) ||
+                   objectName.StartsWith("Tail Seek", StringComparison.OrdinalIgnoreCase);
         }
 
         // =====================================================================
@@ -662,17 +836,6 @@ namespace TailSeek
                     curlReceiver);
 
                 // -------------------------------------------------------------
-                // AIM CONSTRAINT
-                // -------------------------------------------------------------
-
-                if (addDirectionalConstraint)
-                {
-                    CreateAimConstraint(
-                        tailRoot,
-                        trackerTarget);
-                }
-
-                // -------------------------------------------------------------
                 // FX CONTROLLER
                 // -------------------------------------------------------------
 
@@ -685,19 +848,16 @@ namespace TailSeek
                         "The avatar's FX Playable Layer does not have an Animator Controller assigned.");
                 }
 
-                if (mergeTrackerFX)
-                {
-                    MergeTrackerFXController(
-                        fxController,
-                        contactTrackerController);
-                }
+                MergeTrackerFXController(
+                    fxController,
+                    contactTrackerController);
 
-                if (addCurlAnimator)
+                if (addCurlAnimator || addDirectionalCurl)
                 {
                     AddCurlParameter(
                         fxController);
 
-                    AddCurlLayer(
+                    AddSeekLayer(
                         fxController);
                 }
 
@@ -716,13 +876,17 @@ namespace TailSeek
 
                 if (createTestPrefab)
                 {
-                    CreateTestObjectPrefab();
+                    GameObject testObject = CreateTestObjectPrefab();
                     AssetDatabase.SaveAssets();
                     AssetDatabase.Refresh();
+                    if (testObject != null)
+                        Selection.activeGameObject = testObject;
                 }
-
-                Selection.activeGameObject =
-                    trackerObject;
+                else
+                {
+                    Selection.activeGameObject =
+                        trackerObject;
+                }
 
                 EditorUtility.DisplayDialog(
                     "Tail Seek Built",
@@ -733,11 +897,10 @@ namespace TailSeek
                     tailTip.name +
                     "\n\nCollision Tag:\n" +
                     collisionTag +
-                    "\n\nTracker FX was " +
-                    (mergeTrackerFX
-                        ? "merged into"
-                        : "not merged into") +
-                    " the avatar FX controller.",
+                    "\n\nVRLabs Contact Tracker FX was merged into the avatar FX controller." +
+                    (addDirectionalCurl
+                        ? "\n\nLeft/Right curl is driven by ContactTracker/X- and X+."
+                        : ""),
                     "OK");
             }
             catch (Exception exception)
@@ -761,7 +924,7 @@ namespace TailSeek
         // PLAY MODE TEST PREFAB
         // =====================================================================
 
-        private void CreateTestObjectPrefab()
+        private GameObject CreateTestObjectPrefab()
         {
             if (string.IsNullOrWhiteSpace(collisionTag))
                 throw new Exception("Collision Tag cannot be empty before creating the test prefab.");
@@ -773,10 +936,12 @@ namespace TailSeek
                 throw new Exception("Test Move Speed must be greater than zero.");
 
             EnsureFolder("Assets", "TailSeek", "Generated");
+            RemoveSceneTestObjects();
 
-            // Keep the root unscaled so the Contact Sender radius is not
-            // multiplied by the visual mesh scale.
-            GameObject testObject = new GameObject("TailSeek Test Object");
+            GameObject testObject = new GameObject(GeneratedTestObjectName);
+            Undo.RegisterCreatedObjectUndo(
+                testObject,
+                "Create Tail Seek Test Object");
 
             GameObject visual = GameObject.CreatePrimitive(PrimitiveType.Sphere);
             visual.name = "Visual";
@@ -797,6 +962,7 @@ namespace TailSeek
             TailSeekTestObject mover = testObject.AddComponent<TailSeekTestObject>();
             mover.moveSpeed = testMoveSpeed;
             mover.collisionTag = collisionTag;
+            mover.fullCurlDistance = fullCurlDistance;
             mover.simulateContacts = true;
 
             string prefabPath = testPrefabPath.Replace("\\", "/");
@@ -804,15 +970,60 @@ namespace TailSeek
             if (existing != null)
                 AssetDatabase.DeleteAsset(prefabPath);
 
-            GameObject prefab = PrefabUtility.SaveAsPrefabAsset(testObject, prefabPath);
+            GameObject prefab = PrefabUtility.SaveAsPrefabAssetAndConnect(
+                testObject,
+                prefabPath,
+                InteractionMode.AutomatedAction);
+
             if (prefab == null)
             {
                 DestroyImmediate(testObject);
                 throw new Exception("Unity could not save the TailSeek Test Object prefab at " + prefabPath);
             }
 
-            DestroyImmediate(testObject);
+            PlaceTestObjectOnAvatar(testObject);
             Debug.Log("Tail Seek: created test prefab at " + prefabPath);
+            return testObject;
+        }
+
+        private void RemoveSceneTestObjects()
+        {
+            TailSeekTestObject[] existing =
+                FindObjectsOfType<TailSeekTestObject>();
+
+            for (int i = 0; i < existing.Length; i++)
+            {
+                if (existing[i] == null)
+                    continue;
+
+                Undo.DestroyObjectImmediate(existing[i].gameObject);
+            }
+        }
+
+        private void PlaceTestObjectOnAvatar(GameObject testObject)
+        {
+            if (testObject == null)
+                return;
+
+            if (avatar == null)
+            {
+                Debug.LogWarning(
+                    "Tail Seek: assign an Avatar to place the test object on the avatar automatically.");
+                return;
+            }
+
+            if (hip == null)
+                hip = FindHipsBone();
+
+            Transform placeAt =
+                hip != null ? hip : avatar.transform;
+
+            testObject.transform.SetParent(avatar.transform, true);
+            testObject.transform.position = placeAt.position;
+            testObject.transform.rotation = Quaternion.identity;
+            testObject.transform.localScale = Vector3.one;
+            testObject.name = GeneratedTestObjectName;
+            Selection.activeGameObject = testObject;
         }
 
         private static void EnsureFolder(params string[] parts)
@@ -836,6 +1047,8 @@ namespace TailSeek
 
         private void Validate()
         {
+            TryFindTrackerAssets();
+
             if (avatar == null)
                 throw new Exception(
                     "Avatar is not assigned.");
@@ -848,23 +1061,28 @@ namespace TailSeek
                 throw new Exception(
                     "Tail Tip is not assigned.");
 
+            hip = FindHipsBone();
+
             if (hip == null)
+            {
                 throw new Exception(
-                    "Hip is not assigned.");
+                    "Could not find the Hip bone. " +
+                    "The first bone parented to the Armature is used automatically.");
+            }
 
             if (contactTrackerPrefab == null)
                 throw new Exception(
-                    "Contact Tracker Prefab is not assigned.");
+                    "Could not find the VRLabs Contact Tracker prefab. Import Contact Tracker into this project.");
 
             if (contactTrackerController == null)
                 throw new Exception(
-                    "Contact Tracker FX Controller is not assigned.");
+                    "Could not find the VRLabs Contact Tracker FX controller. Import Contact Tracker into this project.");
 
             if (addCurlAnimator &&
                 curlAnimation == null)
             {
                 throw new Exception(
-                    "Curl Animation is not assigned.");
+                    "Tail Wrapping Animation is not assigned.");
             }
 
             if (string.IsNullOrWhiteSpace(
@@ -894,12 +1112,12 @@ namespace TailSeek
                         "Curl Start Distance must be greater than zero.");
                 }
 
-                if (fullCurlDistance < 0 ||
-                    fullCurlDistance >= curlDistance)
+                if (fullCurlDistance <= 0 ||
+                    fullCurlDistance > curlDistance)
                 {
                     throw new Exception(
-                        "Full Curl Distance must be greater than or equal to 0 " +
-                        "and strictly smaller than Curl Start Distance.");
+                        "Full Curl Distance must be greater than 0 " +
+                        "and no larger than Curl Start Distance.");
                 }
 
                 if (string.IsNullOrWhiteSpace(
@@ -910,16 +1128,19 @@ namespace TailSeek
                 }
             }
 
-            if (aimAxis == Vector3.zero)
+            if (addDirectionalCurl)
             {
-                throw new Exception(
-                    "Tail Forward Axis cannot be zero.");
-            }
+                if (leftCurlAnimation == null)
+                {
+                    throw new Exception(
+                        "Left Curl Animation is not assigned.");
+                }
 
-            if (upAxis == Vector3.zero)
-            {
-                throw new Exception(
-                    "Tail Up Axis cannot be zero.");
+                if (rightCurlAnimation == null)
+                {
+                    throw new Exception(
+                        "Right Curl Animation is not assigned.");
+                }
             }
 
             if (!IsDescendantOf(
@@ -1044,6 +1265,7 @@ namespace TailSeek
             RemoveGeneratedHierarchy(avatarRoot);
             RemoveGeneratedContacts(avatarRoot);
             RemoveGeneratedAimConstraints(avatarRoot);
+            RemoveGeneratedRotationConstraints(avatarRoot);
 
             AnimatorController fxController = GetFXController();
             if (fxController != null)
@@ -1116,6 +1338,7 @@ namespace TailSeek
                 objectName == GeneratedSenderName ||
                 objectName == GeneratedCurlReceiverName ||
                 objectName == GeneratedTargetName ||
+                objectName == GeneratedAimProxyName ||
                 objectName == "Tracker Target" ||
                 objectName == "TrackerTarget")
             {
@@ -1309,6 +1532,41 @@ namespace TailSeek
             return false;
         }
 
+        private void RemoveGeneratedRotationConstraints(Transform avatarRoot)
+        {
+            if (avatarRoot == null)
+                return;
+
+            RotationConstraint[] constraints =
+                avatarRoot.GetComponentsInChildren<RotationConstraint>(true);
+
+            foreach (RotationConstraint constraint in constraints)
+            {
+                if (constraint == null)
+                    continue;
+
+                bool generated = false;
+                for (int i = 0; i < constraint.sourceCount; i++)
+                {
+                    ConstraintSource source = constraint.GetSource(i);
+                    if (source.sourceTransform == null)
+                        continue;
+
+                    string sourceName = source.sourceTransform.name;
+                    if (sourceName == GeneratedAimProxyName ||
+                        sourceName == GeneratedTargetName ||
+                        sourceName.StartsWith("TailSeek", StringComparison.OrdinalIgnoreCase))
+                    {
+                        generated = true;
+                        break;
+                    }
+                }
+
+                if (generated)
+                    Undo.DestroyObjectImmediate(constraint);
+            }
+        }
+
         private void RemoveGeneratedFxLayers(AnimatorController controller)
         {
             for (int i = controller.layers.Length - 1; i >= 0; i--)
@@ -1324,6 +1582,7 @@ namespace TailSeek
                 return false;
 
             if (layerName == CurlLayerName ||
+                layerName == SeekLayerName ||
                 layerName == "Contact Tracker Control" ||
                 layerName == "Contact Tracker Blend Tree")
             {
@@ -1425,17 +1684,21 @@ namespace TailSeek
         private void RemoveGeneratedCurlLayer(
             AnimatorController controller)
         {
-            for (int i =
-                    controller.layers.Length - 1;
-                 i >= 0;
-                 i--)
-            {
-                if (controller.layers[i].name ==
-                    CurlLayerName)
-                {
-                    controller.RemoveLayer(i);
-                }
-            }
+            RemoveLayerIfPresent(
+                controller,
+                CurlLayerName);
+
+            RemoveLayerIfPresent(
+                controller,
+                CurlRemapLayerName);
+
+            RemoveLayerIfPresent(
+                controller,
+                DirectionLayerName);
+
+            RemoveLayerIfPresent(
+                controller,
+                SeekLayerName);
         }
 
         private void RemoveLayerIfPresent(
@@ -1458,6 +1721,38 @@ namespace TailSeek
         // =====================================================================
         // HIERARCHY HELPERS
         // =====================================================================
+
+        private Transform FindChildRecursiveIgnoreCase(
+            Transform parent,
+            string childName)
+        {
+            if (parent == null ||
+                string.IsNullOrEmpty(childName))
+            {
+                return null;
+            }
+
+            foreach (Transform child in parent)
+            {
+                if (string.Equals(
+                    child.name,
+                    childName,
+                    StringComparison.OrdinalIgnoreCase))
+                {
+                    return child;
+                }
+
+                Transform result =
+                    FindChildRecursiveIgnoreCase(
+                        child,
+                        childName);
+
+                if (result != null)
+                    return result;
+            }
+
+            return null;
+        }
 
         private Transform FindChildRecursive(
             Transform parent,
@@ -1664,75 +1959,6 @@ namespace TailSeek
 
             EditorUtility.SetDirty(
                 receiver);
-        }
-
-        // =====================================================================
-        // AIM CONSTRAINT
-        // =====================================================================
-
-        private void CreateAimConstraint(
-            Transform tail,
-            Transform target)
-        {
-            AimConstraint constraint =
-                tail.GetComponent<AimConstraint>();
-
-            if (constraint == null)
-            {
-                constraint =
-                    Undo.AddComponent<AimConstraint>(
-                        tail.gameObject);
-            }
-
-            constraint.constraintActive =
-                false;
-
-            constraint.locked =
-                false;
-
-            for (int i =
-                    constraint.sourceCount - 1;
-                 i >= 0;
-                 i--)
-            {
-                constraint.RemoveSource(i);
-            }
-
-            constraint.aimVector =
-                aimAxis.normalized;
-
-            constraint.upVector =
-                upAxis.normalized;
-
-            constraint.worldUpType =
-                AimConstraint
-                    .WorldUpType
-                    .SceneUp;
-
-            constraint.rotationAtRest =
-                tail.localRotation.eulerAngles;
-
-            constraint.rotationOffset =
-                Vector3.zero;
-
-            ConstraintSource source =
-                new ConstraintSource
-                {
-                    sourceTransform = target,
-                    weight = 1.0f
-                };
-
-            constraint.AddSource(
-                source);
-
-            constraint.weight =
-                1.0f;
-
-            constraint.constraintActive =
-                true;
-
-            EditorUtility.SetDirty(
-                constraint);
         }
 
         // =====================================================================
@@ -2441,13 +2667,31 @@ namespace TailSeek
         // CURL FX LAYER
         // =====================================================================
 
+        private string CurlTimeParameterName
+        {
+            get { return curlParameter + "_Time"; }
+        }
+
         private void AddCurlParameter(
             AnimatorController controller)
+        {
+            AddFloatParameterIfMissing(
+                controller,
+                curlParameter);
+
+            AddFloatParameterIfMissing(
+                controller,
+                CurlTimeParameterName);
+        }
+
+        private void AddFloatParameterIfMissing(
+            AnimatorController controller,
+            string parameterName)
         {
             AnimatorControllerParameter existing =
                 FindParameter(
                     controller,
-                    curlParameter);
+                    parameterName);
 
             if (existing != null)
             {
@@ -2456,7 +2700,7 @@ namespace TailSeek
                 {
                     throw new Exception(
                         "Animator parameter '" +
-                        curlParameter +
+                        parameterName +
                         "' already exists but is not a Float.");
                 }
 
@@ -2466,7 +2710,7 @@ namespace TailSeek
             AnimatorControllerParameter parameter =
                 new AnimatorControllerParameter
                 {
-                    name = curlParameter,
+                    name = parameterName,
                     type =
                         AnimatorControllerParameterType.Float,
                     defaultFloat = 0f
@@ -2479,7 +2723,30 @@ namespace TailSeek
                 controller);
         }
 
-        private void AddCurlLayer(
+        private string SeekMotionTimeParameter
+        {
+            get
+            {
+                if (addCurlAnimator &&
+                    fullCurlDistance + 0.0001f < curlDistance)
+                {
+                    return CurlTimeParameterName;
+                }
+
+                return curlParameter;
+            }
+        }
+
+        private bool UsesCurlTimeRemap
+        {
+            get
+            {
+                return addCurlAnimator &&
+                       fullCurlDistance + 0.0001f < curlDistance;
+            }
+        }
+
+        private void AddSeekLayer(
             AnimatorController controller)
         {
             RemoveGeneratedCurlLayer(
@@ -2489,10 +2756,330 @@ namespace TailSeek
                 AssetDatabase.GetAssetPath(
                     controller);
 
+            if (UsesCurlTimeRemap)
+            {
+                AddCurlRemapLayer(
+                    controller,
+                    controllerPath);
+            }
+
+            AddFloatParameterIfMissing(
+                controller,
+                TrackerLeftParameter);
+
+            AddFloatParameterIfMissing(
+                controller,
+                TrackerRightParameter);
+
             AnimatorControllerLayer layer =
                 new AnimatorControllerLayer
                 {
-                    name = CurlLayerName,
+                    name = SeekLayerName,
+                    defaultWeight = 1.0f,
+                    blendingMode =
+                        AnimatorLayerBlendingMode.Override,
+                    stateMachine =
+                        new AnimatorStateMachine()
+                };
+
+            layer.stateMachine.name = SeekLayerName;
+
+            if (!string.IsNullOrEmpty(controllerPath))
+            {
+                AssetDatabase.AddObjectToAsset(
+                    layer.stateMachine,
+                    controllerPath);
+            }
+
+            controller.AddLayer(layer);
+            PersistLayerDefaultWeight(
+                controller,
+                SeekLayerName,
+                1.0f);
+
+            AnimatorStateMachine machine =
+                GetLayerStateMachine(
+                    controller,
+                    SeekLayerName);
+
+            if (machine == null)
+            {
+                throw new Exception(
+                    "Unity did not keep the Tail Seek layer state machine.");
+            }
+
+            bool hasWrap = addCurlAnimator && curlAnimation != null;
+            bool hasDirection = addDirectionalCurl &&
+                leftCurlAnimation != null &&
+                rightCurlAnimation != null;
+
+            AnimatorState idleState = null;
+            AnimatorState wrapState = null;
+            AnimatorState leftState = null;
+            AnimatorState rightState = null;
+
+            if (hasDirection || !hasWrap)
+            {
+                idleState = CreateSeekState(
+                    machine,
+                    "Idle",
+                    CreateEmptyClip(controller),
+                    new Vector3(250, 0, 0),
+                    false);
+            }
+
+            if (hasWrap)
+            {
+                wrapState = CreateSeekState(
+                    machine,
+                    "Wrap",
+                    curlAnimation,
+                    new Vector3(250, 120, 0),
+                    true);
+
+                if (wrapState.motion == null)
+                {
+                    throw new Exception(
+                        "The wrapping animation was not saved onto the Wrap state. " +
+                        "Make sure the Tail Wrapping Animation field is assigned.");
+                }
+            }
+
+            if (hasDirection)
+            {
+                leftState = CreateSeekState(
+                    machine,
+                    "Left Curl",
+                    leftCurlAnimation,
+                    new Vector3(40, 120, 0),
+                    true);
+
+                rightState = CreateSeekState(
+                    machine,
+                    "Right Curl",
+                    rightCurlAnimation,
+                    new Vector3(460, 120, 0),
+                    true);
+            }
+
+            if (hasWrap && !hasDirection)
+            {
+                machine.defaultState = wrapState;
+            }
+            else if (idleState != null)
+            {
+                machine.defaultState = idleState;
+            }
+            else if (wrapState != null)
+            {
+                machine.defaultState = wrapState;
+            }
+
+            if (hasWrap && hasDirection)
+            {
+                WireWrapAndDirectionTransitions(
+                    idleState,
+                    wrapState,
+                    leftState,
+                    rightState);
+            }
+            else if (hasDirection)
+            {
+                WireDirectionOnlyTransitions(
+                    idleState,
+                    leftState,
+                    rightState);
+            }
+
+            PersistLayerDefaultWeight(
+                controller,
+                SeekLayerName,
+                1.0f);
+
+            EditorUtility.SetDirty(machine);
+            EditorUtility.SetDirty(controller);
+        }
+
+        private AnimatorState CreateSeekState(
+            AnimatorStateMachine machine,
+            string stateName,
+            Motion motion,
+            Vector3 position,
+            bool useMotionTime)
+        {
+            AnimatorState state = machine.AddState(stateName, position);
+            state.motion = motion;
+            state.writeDefaultValues = false;
+            state.speed = 1.0f;
+            state.speedParameterActive = false;
+
+            if (useMotionTime)
+            {
+                state.timeParameterActive = true;
+                state.timeParameter = SeekMotionTimeParameter;
+            }
+
+            return state;
+        }
+
+        private void WireWrapAndDirectionTransitions(
+            AnimatorState idle,
+            AnimatorState wrap,
+            AnimatorState left,
+            AnimatorState right)
+        {
+            const float sideOn = 0.12f;
+            const float sideOff = 0.05f;
+            const float wrapOn = 0.04f;
+            const float wrapOff = 0.02f;
+
+            AddTransition(
+                idle,
+                right,
+                Greater(TrackerRightParameter, sideOn));
+            AddTransition(
+                idle,
+                left,
+                Greater(TrackerLeftParameter, sideOn));
+            AddTransition(
+                idle,
+                wrap,
+                Greater(curlParameter, wrapOn));
+
+            AddTransition(
+                wrap,
+                right,
+                Greater(TrackerRightParameter, sideOn));
+            AddTransition(
+                wrap,
+                left,
+                Greater(TrackerLeftParameter, sideOn));
+            AddTransition(
+                wrap,
+                idle,
+                Less(curlParameter, wrapOff));
+
+            AddTransition(
+                left,
+                right,
+                Greater(TrackerRightParameter, sideOn));
+            AddTransition(
+                left,
+                wrap,
+                Less(TrackerLeftParameter, sideOff),
+                Greater(curlParameter, wrapOn));
+            AddTransition(
+                left,
+                idle,
+                Less(TrackerLeftParameter, sideOff),
+                Less(curlParameter, wrapOff));
+
+            AddTransition(
+                right,
+                left,
+                Greater(TrackerLeftParameter, sideOn),
+                Less(TrackerRightParameter, sideOn));
+            AddTransition(
+                right,
+                wrap,
+                Less(TrackerRightParameter, sideOff),
+                Greater(curlParameter, wrapOn));
+            AddTransition(
+                right,
+                idle,
+                Less(TrackerRightParameter, sideOff),
+                Less(curlParameter, wrapOff));
+        }
+
+        private void WireDirectionOnlyTransitions(
+            AnimatorState idle,
+            AnimatorState left,
+            AnimatorState right)
+        {
+            const float sideOn = 0.12f;
+            const float sideOff = 0.05f;
+
+            AddTransition(
+                idle,
+                right,
+                Greater(TrackerRightParameter, sideOn));
+            AddTransition(
+                idle,
+                left,
+                Greater(TrackerLeftParameter, sideOn));
+            AddTransition(
+                left,
+                right,
+                Greater(TrackerRightParameter, sideOn));
+            AddTransition(
+                left,
+                idle,
+                Less(TrackerLeftParameter, sideOff));
+            AddTransition(
+                right,
+                left,
+                Greater(TrackerLeftParameter, sideOn),
+                Less(TrackerRightParameter, sideOn));
+            AddTransition(
+                right,
+                idle,
+                Less(TrackerRightParameter, sideOff));
+        }
+
+        private static AnimatorCondition Greater(string parameter, float threshold)
+        {
+            return new AnimatorCondition
+            {
+                mode = AnimatorConditionMode.Greater,
+                parameter = parameter,
+                threshold = threshold
+            };
+        }
+
+        private static AnimatorCondition Less(string parameter, float threshold)
+        {
+            return new AnimatorCondition
+            {
+                mode = AnimatorConditionMode.Less,
+                parameter = parameter,
+                threshold = threshold
+            };
+        }
+
+        private static void AddTransition(
+            AnimatorState from,
+            AnimatorState to,
+            params AnimatorCondition[] conditions)
+        {
+            AnimatorStateTransition transition = from.AddTransition(to);
+            transition.hasExitTime = false;
+            transition.hasFixedDuration = true;
+            transition.duration = 0f;
+            transition.exitTime = 0f;
+            transition.canTransitionToSelf = false;
+            transition.interruptionSource = TransitionInterruptionSource.Source;
+
+            for (int i = 0; i < conditions.Length; i++)
+            {
+                transition.AddCondition(
+                    conditions[i].mode,
+                    conditions[i].threshold,
+                    conditions[i].parameter);
+            }
+        }
+
+        private void AddCurlRemapLayer(
+            AnimatorController controller,
+            string controllerPath)
+        {
+            RemoveLayerIfPresent(
+                controller,
+                CurlRemapLayerName);
+
+            AnimatorControllerLayer layer =
+                new AnimatorControllerLayer
+                {
+                    name = CurlRemapLayerName,
                     defaultWeight = 1.0f,
                     blendingMode =
                         AnimatorLayerBlendingMode.Override,
@@ -2501,87 +3088,148 @@ namespace TailSeek
                 };
 
             layer.stateMachine.name =
-                CurlLayerName;
+                CurlRemapLayerName;
 
             layer.stateMachine.hideFlags =
                 HideFlags.HideInHierarchy;
 
-            if (!string.IsNullOrEmpty(
-                controllerPath))
+            if (!string.IsNullOrEmpty(controllerPath))
             {
                 AssetDatabase.AddObjectToAsset(
                     layer.stateMachine,
                     controllerPath);
             }
 
-            controller.AddLayer(
-                layer);
-
+            controller.AddLayer(layer);
             PersistLayerDefaultWeight(
                 controller,
-                CurlLayerName,
+                CurlRemapLayerName,
                 1.0f);
 
             AnimatorStateMachine machine =
                 GetLayerStateMachine(
                     controller,
-                    CurlLayerName);
+                    CurlRemapLayerName);
 
             if (machine == null)
             {
                 throw new Exception(
-                    "Unity did not keep the Tail Seek curl layer state machine.");
+                    "Unity did not keep the Tail Seek curl remap layer.");
             }
 
-            AnimatorState curlState =
+            BlendTree tree =
+                new BlendTree
+                {
+                    name = "Tail Seek Curl Time",
+                    blendType = BlendTreeType.Simple1D,
+                    blendParameter = curlParameter,
+                    useAutomaticThresholds = false,
+                    hideFlags = HideFlags.HideInHierarchy
+                };
+
+            if (!string.IsNullOrEmpty(controllerPath))
+                AssetDatabase.AddObjectToAsset(tree, controllerPath);
+
+            AnimationClip restClip =
+                CreateAnimatorFloatClip(
+                    controller,
+                    CurlTimeParameterName,
+                    0f,
+                    "TailSeek_CurlTime_Rest");
+
+            AnimationClip fullClip =
+                CreateAnimatorFloatClip(
+                    controller,
+                    CurlTimeParameterName,
+                    1f,
+                    "TailSeek_CurlTime_Full");
+
+            float fullThreshold =
+                FullCurlProximityThreshold();
+
+            tree.AddChild(restClip, 0f);
+            tree.AddChild(fullClip, fullThreshold);
+            if (fullThreshold < 0.999f)
+                tree.AddChild(fullClip, 1f);
+
+            AnimatorState remapState =
                 machine.AddState(
-                    "Curl Depth",
+                    "Curl Time Remap",
                     new Vector3(250, 0, 0));
 
-            curlState.hideFlags =
-                HideFlags.HideInHierarchy;
-
-            curlState.motion =
-                curlAnimation;
-
-            curlState.writeDefaultValues =
-                false;
-
-            curlState.speed =
-                1.0f;
-
-            curlState.speedParameterActive =
-                false;
-
-            curlState.timeParameterActive =
-                true;
-
-            curlState.timeParameter =
-                curlParameter;
-
-            if (curlState.motion == null)
-            {
-                throw new Exception(
-                    "The curl animation was not saved onto the Curl Depth state. " +
-                    "Make sure the Curl Animation field is assigned.");
-            }
-
-            machine.defaultState =
-                curlState;
+            remapState.hideFlags = HideFlags.HideInHierarchy;
+            remapState.motion = tree;
+            remapState.writeDefaultValues = false;
+            machine.defaultState = remapState;
 
             PersistLayerDefaultWeight(
                 controller,
-                CurlLayerName,
+                CurlRemapLayerName,
                 1.0f);
 
-            EditorUtility.SetDirty(
-                curlState);
+            EditorUtility.SetDirty(remapState);
+            EditorUtility.SetDirty(machine);
+            EditorUtility.SetDirty(controller);
+        }
 
-            EditorUtility.SetDirty(
-                machine);
+        private float FullCurlProximityThreshold()
+        {
+            if (curlDistance <= 0f)
+                return 1f;
 
-            EditorUtility.SetDirty(
-                controller);
+            if (fullCurlDistance >= curlDistance)
+                return 0.0001f;
+
+            return Mathf.Clamp01(1f - fullCurlDistance / curlDistance);
+        }
+
+        private AnimationClip CreateAnimatorFloatClip(
+            AnimatorController controller,
+            string parameterName,
+            float value,
+            string clipName)
+        {
+            string controllerPath =
+                AssetDatabase.GetAssetPath(controller);
+
+            string directory =
+                Path.GetDirectoryName(controllerPath);
+
+            if (string.IsNullOrEmpty(directory))
+                directory = "Assets";
+
+            directory = directory.Replace("\\", "/");
+
+            string path = directory + "/" + clipName + ".anim";
+
+            AnimationClip clip =
+                AssetDatabase.LoadAssetAtPath<AnimationClip>(path);
+
+            if (clip == null)
+            {
+                clip = new AnimationClip
+                {
+                    name = clipName,
+                    frameRate = 60f
+                };
+
+                AssetDatabase.CreateAsset(clip, path);
+            }
+
+            EditorCurveBinding binding =
+                new EditorCurveBinding
+                {
+                    path = "",
+                    type = typeof(Animator),
+                    propertyName = parameterName
+                };
+
+            AnimationCurve curve =
+                AnimationCurve.Constant(0f, 0f, value);
+
+            AnimationUtility.SetEditorCurve(clip, binding, curve);
+            EditorUtility.SetDirty(clip);
+            return clip;
         }
 
         private static AnimatorStateMachine GetLayerStateMachine(

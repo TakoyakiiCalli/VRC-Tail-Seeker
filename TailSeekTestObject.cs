@@ -32,16 +32,23 @@ public class TailSeekTestObject : MonoBehaviour
     [Tooltip("Optional override. If empty, the VRCContactSender collision tags are used.")]
     public string collisionTag = "";
 
+    [Tooltip("Radius at which curl Motion Time reaches 1. Must be no larger than the hip receiver radius.")]
+    public float fullCurlDistance = 2.0f;
+
     [Header("Debug")]
     public float debugCurl;
     public float debugTrackerMax;
+    public float debugLeft;
+    public float debugRight;
     public int debugMatchedReceivers;
     public int debugParamAccessCount;
+    public bool debugGestureManager;
 
     private VRCContactSender sender;
     private VRCContactReceiver[] receiverCache;
     private float receiverCacheTime = -1f;
     private bool loggedFirstHit;
+    private bool loggedMissingGestureManager;
     private readonly List<SimulatedParamAccess> overlays = new List<SimulatedParamAccess>();
 
     private static Type gestureManagerType;
@@ -123,56 +130,50 @@ public class TailSeekTestObject : MonoBehaviour
     {
         debugCurl = 0f;
         debugTrackerMax = 0f;
+        debugLeft = 0f;
+        debugRight = 0f;
         debugMatchedReceivers = 0;
         debugParamAccessCount = 0;
+        debugGestureManager = GestureManagerIsControlling();
+
+        if (!debugGestureManager)
+            WarnMissingGestureManager();
 
         RefreshReceiverCache();
-        if (receiverCache == null || receiverCache.Length == 0)
-            return;
-
-        Vector3 senderCenter = GetContactWorldPosition(sender, transform);
-        float senderRadius = GetContactWorldRadius(sender, transform, 0.025f);
-
-        for (int i = 0; i < receiverCache.Length; i++)
+        if (receiverCache != null)
         {
-            VRCContactReceiver receiver = receiverCache[i];
-            if (receiver == null || !receiver.isActiveAndEnabled)
-                continue;
+            Vector3 senderCenter = GetContactWorldPosition(sender, transform);
+            float senderRadius = GetContactWorldRadius(sender, transform, 0.025f);
 
-            if (!receiver.allowOthers)
-                continue;
-
-            if (receiver.transform.IsChildOf(transform))
-                continue;
-
-            if (!TagsMatch(receiver))
-                continue;
-
-            if (string.IsNullOrEmpty(receiver.parameter))
-                continue;
-
-            float proximity = ComputeProximity(
-                senderCenter,
-                senderRadius,
-                receiver);
-
-            debugMatchedReceivers++;
-            WriteReceiver(receiver, proximity);
-
-            if (receiver.parameter.IndexOf("Curl", StringComparison.OrdinalIgnoreCase) >= 0 &&
-                proximity > debugCurl)
+            for (int i = 0; i < receiverCache.Length; i++)
             {
-                debugCurl = proximity;
-            }
+                VRCContactReceiver receiver = receiverCache[i];
+                if (receiver == null || !receiver.isActiveAndEnabled)
+                    continue;
 
-            if (receiver.parameter.StartsWith("ContactTracker/", StringComparison.Ordinal) &&
-                proximity > debugTrackerMax)
-            {
-                debugTrackerMax = proximity;
+                if (receiver.transform.IsChildOf(transform))
+                    continue;
+
+                if (!TagsMatch(receiver))
+                    continue;
+
+                if (string.IsNullOrEmpty(receiver.parameter))
+                    continue;
+
+                float proximity = ComputeProximity(
+                    senderCenter,
+                    senderRadius,
+                    receiver);
+
+                debugMatchedReceivers++;
+                WriteReceiver(receiver, proximity);
+                TrackDebug(receiver.parameter, proximity);
             }
         }
 
-        if (debugTrackerMax > 0.01f)
+        DriveFromAvatarHips();
+
+        if (debugTrackerMax > 0.01f || debugCurl > 0.01f)
             TryWriteGestureManager("ContactTracker/Control", 1f);
 
         if (!loggedFirstHit && debugCurl > 0.01f)
@@ -180,10 +181,12 @@ public class TailSeekTestObject : MonoBehaviour
             loggedFirstHit = true;
             Debug.Log(
                 "Tail Seek: curl proximity " + debugCurl.ToString("0.00") +
-                ", tracker max " + debugTrackerMax.ToString("0.00") +
+                ", left " + debugLeft.ToString("0.00") +
+                ", right " + debugRight.ToString("0.00") +
                 ", matched " + debugMatchedReceivers +
                 ", paramAccess " + debugParamAccessCount +
-                ". Gesture Manager ContactTracker values should move off 0.");
+                ", Gesture Manager " + (debugGestureManager ? "controlling" : "NOT controlling") +
+                ".");
         }
     }
 
@@ -194,15 +197,202 @@ public class TailSeekTestObject : MonoBehaviour
         overlay.Hold = true;
         overlay.Push();
 
-        TryWriteGestureManager(receiver.parameter, proximity);
+        WriteFloat(receiver.parameter, proximity, GetAvatarAnimator(receiver));
 
-        Animator animator = GetAvatarAnimator(receiver);
+        if (receiver.parameter.IndexOf("Curl", StringComparison.OrdinalIgnoreCase) >= 0)
+        {
+            float receiverRadius = GetContactWorldRadius(
+                receiver,
+                receiver.transform,
+                2.0f);
+
+            float curlTime = RemapToFullCurl(
+                proximity,
+                receiverRadius,
+                fullCurlDistance);
+
+            WriteFloat(receiver.parameter + "_Time", curlTime, GetAvatarAnimator(receiver));
+        }
+    }
+
+    private void TrackDebug(string parameter, float proximity)
+    {
+        if (string.IsNullOrEmpty(parameter))
+            return;
+
+        if (parameter.IndexOf("Curl", StringComparison.OrdinalIgnoreCase) >= 0 &&
+            parameter.IndexOf("Time", StringComparison.OrdinalIgnoreCase) < 0)
+        {
+            if (proximity > debugCurl)
+                debugCurl = proximity;
+        }
+
+        if (parameter == "ContactTracker/X-")
+            debugLeft = Mathf.Max(debugLeft, proximity);
+
+        if (parameter == "ContactTracker/X+")
+            debugRight = Mathf.Max(debugRight, proximity);
+
+        if (parameter.StartsWith("ContactTracker/", StringComparison.Ordinal) &&
+            proximity > debugTrackerMax)
+        {
+            debugTrackerMax = proximity;
+        }
+    }
+
+    private void DriveFromAvatarHips()
+    {
+        VRCAvatarDescriptor[] avatars = FindObjectsOfType<VRCAvatarDescriptor>();
+        if (avatars == null || avatars.Length == 0)
+            return;
+
+        for (int i = 0; i < avatars.Length; i++)
+        {
+            VRCAvatarDescriptor avatar = avatars[i];
+            if (avatar == null || !avatar.isActiveAndEnabled)
+                continue;
+
+            Transform hip = FindHipTransform(avatar.transform);
+            if (hip == null)
+                continue;
+
+            Transform curlReceiverTransform = FindNamedChild(
+                avatar.transform,
+                "TailSeek Curl Receiver");
+
+            Transform probe = curlReceiverTransform != null
+                ? curlReceiverTransform
+                : hip;
+
+            VRCContactReceiver curlReceiver =
+                curlReceiverTransform != null
+                    ? curlReceiverTransform.GetComponent<VRCContactReceiver>()
+                    : null;
+
+            float curlRadius = GetContactWorldRadius(curlReceiver, probe, 2.0f);
+            Vector3 probeCenter = curlReceiver != null
+                ? GetContactWorldPosition(curlReceiver, probe)
+                : probe.position;
+
+            float senderRadius = GetContactWorldRadius(sender, transform, 0.025f);
+            float centerDistance = Vector3.Distance(transform.position, probeCenter);
+            float closest = Mathf.Max(0f, centerDistance - senderRadius);
+            float proximity = closest >= curlRadius
+                ? 0f
+                : Mathf.Clamp01(1f - closest / curlRadius);
+
+            float curlTime = RemapToFullCurl(
+                proximity,
+                curlRadius,
+                fullCurlDistance);
+
+            Animator animator = avatar.GetComponent<Animator>();
+            string curlName = curlReceiver != null &&
+                !string.IsNullOrEmpty(curlReceiver.parameter)
+                    ? curlReceiver.parameter
+                    : "TailSeek_Curl";
+
+            WriteFloat(curlName, proximity, animator);
+            WriteFloat(curlName + "_Time", curlTime, animator);
+
+            Vector3 local = hip.InverseTransformPoint(transform.position);
+            float axisRange = Mathf.Max(curlRadius, 0.0001f);
+            float right = Mathf.Clamp01(local.x / axisRange);
+            float left = Mathf.Clamp01(-local.x / axisRange);
+            float up = Mathf.Clamp01(local.y / axisRange);
+            float down = Mathf.Clamp01(-local.y / axisRange);
+            float forward = Mathf.Clamp01(local.z / axisRange);
+            float back = Mathf.Clamp01(-local.z / axisRange);
+
+            WriteFloat("ContactTracker/X+", right, animator);
+            WriteFloat("ContactTracker/X-", left, animator);
+            WriteFloat("ContactTracker/Y+", up, animator);
+            WriteFloat("ContactTracker/Y-", down, animator);
+            WriteFloat("ContactTracker/Z+", forward, animator);
+            WriteFloat("ContactTracker/Z-", back, animator);
+
+            if (proximity > 0.01f)
+                WriteFloat("ContactTracker/Control", 1f, animator);
+
+            if (curlTime > debugCurl)
+                debugCurl = curlTime;
+
+            debugLeft = Mathf.Max(debugLeft, left);
+            debugRight = Mathf.Max(debugRight, right);
+            debugTrackerMax = Mathf.Max(
+                debugTrackerMax,
+                Mathf.Max(left, right));
+        }
+    }
+
+    private static Transform FindHipTransform(Transform avatarRoot)
+    {
+        Transform curl = FindNamedChild(avatarRoot, "TailSeek Curl Receiver");
+        if (curl != null && curl.parent != null)
+            return curl.parent;
+
+        Transform armature = FindNamedChild(avatarRoot, "Armature");
+        if (armature != null && armature.childCount > 0)
+            return armature.GetChild(0);
+
+        Transform hips = FindNamedChild(avatarRoot, "Hips");
+        if (hips != null)
+            return hips;
+
+        return avatarRoot;
+    }
+
+    private static Transform FindNamedChild(Transform parent, string name)
+    {
+        if (parent == null)
+            return null;
+
+        if (parent.name == name)
+            return parent;
+
+        for (int i = 0; i < parent.childCount; i++)
+        {
+            Transform found = FindNamedChild(parent.GetChild(i), name);
+            if (found != null)
+                return found;
+        }
+
+        return null;
+    }
+
+    private void WriteFloat(string parameterName, float value, Animator animator)
+    {
+        TryWriteGestureManager(parameterName, value);
+
         if (animator != null &&
             animator.isInitialized &&
-            HasFloatParameter(animator, receiver.parameter))
+            HasFloatParameter(animator, parameterName))
         {
-            animator.SetFloat(receiver.parameter, proximity);
+            animator.SetFloat(parameterName, value);
         }
+    }
+
+    private void WarnMissingGestureManager()
+    {
+        if (loggedMissingGestureManager || !Application.isPlaying)
+            return;
+
+        loggedMissingGestureManager = true;
+        Debug.LogWarning(
+            "Tail Seek: Gesture Manager is not controlling an avatar. " +
+            "Enter Play Mode, then select Gesture Manager in the Hierarchy. " +
+            "Without that, FX parameters will stay at 0 and the tail will not curl.");
+    }
+
+    private bool GestureManagerIsControlling()
+    {
+        CacheGestureManagerReflection();
+        if (controlledAvatarsField == null)
+            return false;
+
+        object controlled = controlledAvatarsField.GetValue(null);
+        return controlled is System.Collections.IDictionary avatars &&
+               avatars.Count > 0;
     }
 
     private SimulatedParamAccess EnsureOverlay(VRCContactReceiver receiver)
@@ -314,6 +504,24 @@ public class TailSeekTestObject : MonoBehaviour
         return receiver.collisionTags.Contains("TailSeek");
     }
 
+    private static float RemapToFullCurl(
+        float proximity,
+        float receiverRadius,
+        float fullRadius)
+    {
+        if (receiverRadius <= 0f)
+            return proximity;
+
+        if (fullRadius >= receiverRadius)
+            return proximity > 0.0001f ? 1f : 0f;
+
+        float threshold = 1f - fullRadius / receiverRadius;
+        if (threshold <= 0.0001f)
+            return proximity > 0.0001f ? 1f : 0f;
+
+        return Mathf.Clamp01(proximity / threshold);
+    }
+
     private static float ComputeProximity(
         Vector3 senderCenter,
         float senderRadius,
@@ -378,7 +586,7 @@ public class TailSeekTestObject : MonoBehaviour
             return;
         }
 
-        receiverCache = FindObjectsOfType<VRCContactReceiver>();
+        receiverCache = FindObjectsOfType<VRCContactReceiver>(true);
         receiverCacheTime = Time.unscaledTime;
     }
 
